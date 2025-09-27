@@ -67,10 +67,13 @@ IMPORTANT: Your response MUST be valid JSON ONLY and match this schema:
 Do not include extra text or explanations.
 """
 
-# Template for structuring the question before sending it to the chat model
 USER_PROMPT_TEMPLATE = """
-Answer the following question:
-{question}
+User wants to swap {makerToken} for {takerToken}.
+- Maximum maker tokens available: {makerMaxAmount}
+- Maximum expiry in hours: {maxExpiry}
+
+Here is recent pool swap data:
+{swap_data}
 """
 
 def reduce_swaps(raw_data: dict, interval_minutes: int = 5):
@@ -130,14 +133,6 @@ def reduce_swaps(raw_data: dict, interval_minutes: int = 5):
 
     return reduced
 
-
-def safe_parse_response(response_text: str) -> AIResponse:
-    try:
-        data = json.loads(response_text.strip())
-        return AIResponse(**data)
-    except Exception as e:
-        raise ValueError(f"Invalid response format: {e}\nResponse: {response_text}")
-    
 def approx_token_count(text: str) -> int:
     """Approximate token count from text length."""
     return len(text) // 4
@@ -170,35 +165,49 @@ def query_openai_chat(prompt: str):
     Returns:
         str: The response from the OpenAI chat model.
     """
-
+    prompt = safe_prompt(prompt)
     chat_completion = client.chat.completions.create(
-        messages=[
-            {
-                "role": "system",
-                "content": prompt,
-            }
-        ],
         model=ASI_ONE_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_schema", "json_schema": AIResponse.model_json_schema()},
     )
-    return (chat_completion.choices[0].message.content)
-        
-# Define a message handler for the agent
+    return chat_completion.choices[0].message.content
+
 @agent.on_message(model=UserInput, replies=AIResponse)
 async def generate_limit_order(ctx: Context, sender: str, tradeInput: UserInput):
-    """
-    Handles incoming questions and responds using OpenAI's chat model.
-    Args:
-        ctx (Context): The agent's execution context.
-        sender (str): The identifier of the sender.
-        tradeInput (UserInput): The received interested swap.
-    Returns:
-        None
-    """
-    ctx.logger.info(f"Received question from {sender}: {tradeInput}")
+    ctx.logger.info(f"Received trade input from {sender}: {tradeInput}")
 
-    prompt = PROMPT_TEMPLATE.format(question=msg.question)
-    response = query_openai_chat(prompt)
-    ctx.logger.info(f"Response: {response}")
-    await ctx.send(
-        'agent1qgesp6djpknf83jltydjwzzzdwg4jm4n2s90yzwl4eua3yjnhwvj6yt30gu', AIResponse(answer=response)
+
+    try:
+        swap_data = fetch_swaps(tradeInput.poolAddress)
+    except Exception as e:
+        ctx.logger.error(f"Swap fetch failed: {e}")
+        await ctx.send(sender, AIResponse(
+        maker=tradeInput.makerToken,
+        taker=tradeInput.takerToken,
+        maker_amount=0,
+        expiry=0
+        ))
+        return
+
+
+    prompt = USER_PROMPT_TEMPLATE.format(
+        makerToken=tradeInput.makerToken,
+        takerToken=tradeInput.takerToken,
+        makerMaxAmount=tradeInput.makerMaxAmount,
+        maxExpiry=tradeInput.maxExpiry,
+        swap_data=json.dumps(swap_data, indent=2)
     )
+
+
+    json_response = query_openai_chat(prompt)
+    ctx.logger.info(f"JSON LLM response: {json_response}")
+
+    if json_response.expiry > tradeInput.maxExpiry:
+        json_response.expiry = int(tradeInput.maxExpiry)
+
+
+    await ctx.send(sender, json_response)
