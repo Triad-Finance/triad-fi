@@ -17,8 +17,8 @@ from pydantic import BaseModel, Field
 
 ASI_ONE_BASE_URL = "https://api.asi1.ai/v1"
 ASI_ONE_API_KEY = os.getenv("ASI_ONE_API_KEY","")
-MAX_TOKENS = 64000
-ASI_ONE_MODEL = "asi1-extended"
+MAX_TOKENS = 32000
+ASI_ONE_MODEL = "asi1-mini"
 THEGRAPH_JWT_TOKEN = os.getenv("THEGRAPH_JWT_TOKEN","")
 
 
@@ -89,108 +89,125 @@ Do not include extra text or explanations.
 """
 
 
+# SYSTEM_PROMPT_2 = """
+# You are a Signal Agent in our DeFi investment/trading platform.
+# Your job: forecast a limit order DeFi swap using technical indicators.
+
+# You will receive history of swaps by general public in JSON sourced from a public API, with fields like:
+
+# {
+#     "timestamp": ...,
+#     "datetime": ...,
+#     "token0": { "symbol": ..., "address": ..., "decimals": ... },
+#     "token1": { "symbol": ..., "address": ..., "decimals": ... },
+#     "amount0": ...,
+#     "amount1": ...,
+#     "price0": ...,
+#     "price1": ...
+# }
+# Rules:
+# - The token with the negative amount (amount0 or amount1) is the taker in the swap.
+# - Study the prices and trade directions to determine if the user should go ahead with the desired swap.
+# - If the swap looks like a bad idea according to technical indicators, set maker_amount = 0 and expiry = 0.
+# - Else, propose a limit order which can be placed right now that can benefit the user
+
+
+# Return ONLY valid JSON matching this schema:
+# {
+#     "maker": string,      // token symbol the user is providing
+#     "taker": string,      // token symbol the user wants
+#     "maker_amount": float, // amount of maker token to swap
+#     "expiry": integer      // hours the order stays live
+# }
+# """
+
 SYSTEM_PROMPT_2 = """
-You are a Signal Agent in our DeFi investment/trading platform.
-Your job: forecast a limit order DeFi swap using technical indicators used in trading.
-The DeFi pool swap data you will receive will be in the following format:
+You are a DeFi Signal Agent. 
 
+steps:
+1. Decide upon appropriate trade indicators
+2. Implement indicators upon provided swap data
+3. Provide a limit order that should be placed within the constraints of the user
+
+Rules:
+- The token with the negative amount is the taker.
+- If the trade looks bad, set maker_amount = 0 and expiry = 0.
+- You MUST return ONLY valid JSON that conforms exactly to the schema as follows:
 {
-    "timestamp":
-    "datetime":,
-    "token0": {
-        "symbol": ,
-        "address": ,
-        "decimals": ,
-    },
-    "token1": {
-        "symbol": ,
-        "address": ,
-        "decimals": ,
-    },
-    "amount0": ,
-    "amount1": ,
-    "price0": ,
-    "price1": ,
+    "maker": string,
+    "taker": string,
+    "maker_amount": float,
+    "expiry": int
 }
+- Do NOT include code fences, markdown, or explanations.
 
-As such, please note that 
-The token with the negative amount (amount0 for token0, amount1 for token1) is the taker in the particular swap
-
-if the swap is a bad idea as per technical indicators, pass maker_amount as 0
-
-
-IMPORTANT: Your response MUST be valid JSON ONLY and match this schema:
-
-{
-    "maker": "USDTO",
-    "taker": "WETH",
-    "maker_amount": "float (e.g., 1.2)",
-    "expiry": "integer (hours, e.g., 45)"
-}
-
-Do not include extra text or explanations. 
 """
 
 
 USER_PROMPT_TEMPLATE = """
 User wants to swap {makerToken} for {takerToken}.
-- Maximum maker tokens available: {makerMaxAmount}
-- Maximum expiry in hours: {maxExpiry}
+- Maximum maker tokens available with the user: {makerMaxAmount}
+- Maximum expiry in hours for the limit order: {maxExpiry}
 
 Here is recent pool swap data:
 {swap_data}
 """
 
 def reduce_swaps(ctx: Context, raw_data: dict, interval_minutes: int = 5):
+
     ctx.logger.info("reducing swaps count")
     swaps = raw_data.get("data", [])
     if not swaps:
+        ctx.logger.info("returning empty")
         return []
 
     # Sort by timestamp ascending
     swaps.sort(key=lambda x: x["timestamp"])
     reduced = []
     interval_map = {}  # interval_start -> (trade, distance)
+    try:
+        for swap in swaps:
+            ts = swap["timestamp"]
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
 
-    for swap in swaps:
-        ts = swap["timestamp"]
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            # Round down to nearest interval mark
+            interval_start = dt.replace(
+                minute=(dt.minute // interval_minutes) * interval_minutes,
+                second=0,
+                microsecond=0
+            )
 
-        # Round down to nearest interval mark
-        interval_start = dt.replace(
-            minute=(dt.minute // interval_minutes) * interval_minutes,
-            second=0,
-            microsecond=0
-        )
+            # Distance from interval start
+            distance = abs((dt - interval_start).total_seconds())
 
-        # Distance from interval start
-        distance = abs((dt - interval_start).total_seconds())
+            if interval_start not in interval_map or distance < interval_map[interval_start][1]:
+                interval_map[interval_start] = (swap, distance)
+        ctx.logger.info(f"Done with interval map")
+        # Keep only the nearest trade per interval
+        for swap, _ in sorted(interval_map.values(), key=lambda x: x[0]["timestamp"]):
+            cleaned = {
+                "timestamp": swap["timestamp"],
+                "datetime": swap.get("datetime") or datetime.fromtimestamp(swap["timestamp"], tz=timezone.utc).isoformat(),
+                "token0": {
+                    "symbol": swap["token0"]["symbol"],
+                    "address": swap["token0"]["address"],
+                    "decimals": swap["token0"]["decimals"],
+                },
+                "token1": {
+                    "symbol": swap["token1"]["symbol"],
+                    "address": swap["token1"]["address"],
+                    "decimals": swap["token1"]["decimals"],
+                },
+                "amount0": float(swap["amount0"]) / 10 ** int(swap["token0"]["decimals"]),
+                "amount1": float(swap["amount1"]) / 10 ** int(swap["token1"]["decimals"]),
+                "price0": swap["price0"],
+                "price1": swap["price1"],
+            }
+            reduced.append(cleaned)
 
-        if interval_start not in interval_map or distance < interval_map[interval_start][1]:
-            interval_map[interval_start] = (swap, distance)
-
-    # Keep only the nearest trade per interval
-    for swap, _ in sorted(interval_map.values(), key=lambda x: x["timestamp"]):
-        cleaned = {
-            "timestamp": swap["timestamp"],
-            "datetime": swap.get("datetime") or datetime.fromtimestamp(swap["timestamp"], tz=timezone.utc).isoformat(),
-            "token0": {
-                "symbol": swap["token0"]["symbol"],
-                "address": swap["token0"]["address"],
-                "decimals": swap["token0"]["decimals"],
-            },
-            "token1": {
-                "symbol": swap["token1"]["symbol"],
-                "address": swap["token1"]["address"],
-                "decimals": swap["token1"]["decimals"],
-            },
-            "amount0": swap["amount0"]/10**swap["token0"]["decimals"],
-            "amount1": swap["amount1"]/10**swap["token1"]["decimals"],
-            "price0": swap["price0"],
-            "price1": swap["price1"],
-        }
-        reduced.append(cleaned)
-    ctx.logger.info(f"reduced length : {len(reduced)}")
+    except Exception as e:
+        ctx.logger.info(f"ran into some error when reducing ")
+        ctx.logger.error(e)
     return reduced
 
 def approx_token_count(text: str) -> int:
@@ -206,10 +223,12 @@ def safe_prompt(prompt: str) -> str:
     return prompt
 
 def fetch_swaps(ctx: Context,poolAddress: str, network: str = "matic", startTime: int = 1735689600, endTime: int = 9999999999, swaps_interval_minutes: int = 5, limit: int = 100):
-    url = f"https://token-api.thegraph.com/swaps/evm?network_id={network}&pool={poolAddress}&protocol=uniswap_v4&&startTime={startTime}&endTime={endTime}&orderBy=timestamp&orderDirection=desc&limit={limit}"
+    url = f"https://token-api.thegraph.com/swaps/evm?network_id={network}&pool={poolAddress}&startTime={startTime}&endTime={endTime}&orderBy=timestamp&orderDirection=desc&limit={limit}"
     headers = {"Authorization": f"Bearer {THEGRAPH_JWT_TOKEN}"}
     response = requests.get(url, headers=headers)
-    ctx.logger.info("response got from The Graph", len(response.json().data))
+    ctx.logger.info("response got from The Graph")
+    # ctx.logger.info(str(response.json()))
+
     response.raise_for_status()
 
     graph_response = response.json()
@@ -268,6 +287,8 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                 maxExpiry=tradeInput.maxExpiry,
                 swap_data=json.dumps(swap_data, indent=2)
             )
+            prompt = safe_prompt(prompt)
+            # ctx.logger.info(f"prompt: {str(prompt)}")
             chat_completion = client.chat.completions.create(
                 model=ASI_ONE_MODEL,
                 messages=[
@@ -275,9 +296,11 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_schema", "json_schema": AIResponse.model_json_schema()},
+                max_completion_tokens= 64000
             )
+            ctx.logger.info(f"JSON LLM response: {chat_completion.choices[0]}")
             json_response_str = chat_completion.choices[0].message.content
-            ctx.logger.info(f"JSON LLM response: {json_response_str}")
+            
 
             try:
                 ai_response = AIResponse.model_validate_json(json_response_str)
