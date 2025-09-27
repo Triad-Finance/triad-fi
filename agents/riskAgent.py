@@ -17,7 +17,6 @@ client = OpenAI(
     base_url= ASI_ONE_BASE_URL
 )
 
-agent = Agent()
 
 
 class UserInput(BaseModel):
@@ -55,7 +54,6 @@ class AIResponse(BaseModel):
 SYSTEM_PROMPT = """
 You are a Signal Agent in our DeFi investment/trading platform.
 Your job: forecast a limit order DeFi swap using technical indicators used in trading.
-If the pool swap data does not match the maker and taker tokens, Give an empty JSON object as output
 The DeFi pool swap data you will receive will be in the following format:
 
 {
@@ -90,7 +88,7 @@ IMPORTANT: Your response MUST be valid JSON ONLY and match this schema:
     "expiry": "integer (hours, e.g., 45)"
 }
 
-Do not include extra text or explanations. 
+Do not include extra text or explanations.
 """
 
 USER_PROMPT_TEMPLATE = """
