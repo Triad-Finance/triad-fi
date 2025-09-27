@@ -53,7 +53,31 @@ class AIResponse(BaseModel):
 
 SYSTEM_PROMPT = """
 You are a Signal Agent in our DeFi investment/trading platform.
-Your job: forecast a limit order DeFi swap.
+Your job: forecast a limit order DeFi swap using technical indicators used in trading.
+The DeFi pool swap data you will receive will be in the following format:
+
+{
+    "timestamp":
+    "datetime":,
+    "token0": {
+        "symbol": ,
+        "address": ,
+        "decimals": ,
+    },
+    "token1": {
+        "symbol": ,
+        "address": ,
+        "decimals": ,
+    },
+    "amount0": ,
+    "amount1": ,
+    "price0": ,
+    "price1": ,
+}
+
+As such, please note that 
+The token with the negative amount (amount0 for token0, amount1 for token1) is the taker in the particular swap
+
 
 IMPORTANT: Your response MUST be valid JSON ONLY and match this schema:
 
@@ -77,43 +101,37 @@ Here is recent pool swap data:
 """
 
 def reduce_swaps(raw_data: dict, interval_minutes: int = 5):
-    """
-    Reduce swaps to one per interval and drop irrelevant fields.
-    
-    Args:
-        raw_data (dict): JSON response from token-api
-        interval_minutes (int): interval size in minutes
-    Returns:
-        list[dict]: reduced swaps
-    """
     swaps = raw_data.get("data", [])
     if not swaps:
         return []
 
+    # Sort by timestamp ascending
+    swaps.sort(key=lambda x: x["timestamp"])
     reduced = []
-    last_interval = None
+    interval_map = {}  # interval_start -> (trade, distance)
 
     for swap in swaps:
         ts = swap["timestamp"]
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
 
-        # Round timestamp down to nearest interval
-        interval = dt - timedelta(
-            minutes=dt.minute % interval_minutes,
-            seconds=dt.second,
-            microseconds=dt.microsecond,
+        # Round down to nearest interval mark
+        interval_start = dt.replace(
+            minute=(dt.minute // interval_minutes) * interval_minutes,
+            second=0,
+            microsecond=0
         )
 
-        # Only take the first swap in each interval
-        if last_interval == interval:
-            continue
-        last_interval = interval
+        # Distance from interval start
+        distance = abs((dt - interval_start).total_seconds())
 
-        # Keep only useful fields
+        if interval_start not in interval_map or distance < interval_map[interval_start][1]:
+            interval_map[interval_start] = (swap, distance)
+
+    # Keep only the nearest trade per interval
+    for swap, _ in sorted(interval_map.values(), key=lambda x: x["timestamp"]):
         cleaned = {
-            "timestamp": ts,
-            "datetime": swap["datetime"],
-            # "pool": swap["pool"],
+            "timestamp": swap["timestamp"],
+            "datetime": swap.get("datetime") or datetime.fromtimestamp(swap["timestamp"], tz=timezone.utc).isoformat(),
             "token0": {
                 "symbol": swap["token0"]["symbol"],
                 "address": swap["token0"]["address"],
@@ -124,8 +142,8 @@ def reduce_swaps(raw_data: dict, interval_minutes: int = 5):
                 "address": swap["token1"]["address"],
                 "decimals": swap["token1"]["decimals"],
             },
-            "amount0": swap["amount0"],
-            "amount1": swap["amount1"],
+            "amount0": swap["amount0"]/10**swap["token0"]["decimals"],
+            "amount1": swap["amount1"]/10**swap["token1"]["decimals"],
             "price0": swap["price0"],
             "price1": swap["price1"],
         }
